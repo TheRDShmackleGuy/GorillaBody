@@ -1,4 +1,4 @@
-﻿using System.Collections;
+using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -35,6 +35,7 @@ public enum TrackerRole
 {
     None,
     Chest,
+    Hip,
     LeftElbow,
     RightElbow
 }
@@ -49,12 +50,27 @@ public struct ElbowResult
     public Vector3 LastElbowPos;
 }
 
+public struct SpineResult
+{
+    public Quaternion ChestRotation;
+    public Quaternion UpperSpineRotation;
+    public Quaternion LowerSpineRotation;
+    public float HeadLeanAngle;
+    public Vector3 HeadLeanAxis;
+}
+
 public class RemoteElbowInfo
 {
-    public int LeftUpperArmPacked;
-    public int LeftForearmPacked;
-    public int RightUpperArmPacked;
-    public int RightForearmPacked;
+    public Quaternion TargetLeftUpper;
+    public Quaternion TargetLeftForearm;
+    public Quaternion TargetRightUpper;
+    public Quaternion TargetRightForearm;
+    public Quaternion TargetUpperSpine;
+    public Quaternion TargetLowerSpine;
+    public Quaternion TargetHeadLean;
+    public float[] FingerCurlsLeft = new float[5];
+    public float[] FingerCurlsRight = new float[5];
+    
     public bool HasData;
 }
 
@@ -73,8 +89,8 @@ public class TrackerData
     public Vector3 SmoothedPosition;
     public Quaternion SmoothedRotation;
 
-    public Vector3 Velocity;
-    public Vector3 AngularVelocity;
+    private Vector3 _velocity;
+    private Vector3 _angularVelocity;
     private Vector3 _lastPosition;
     private Quaternion _lastRotation;
     private bool _initialized;
@@ -87,17 +103,18 @@ public class TrackerData
             return;
         }
 
-        if (Time.deltaTime > 0f)
+        if (Time.deltaTime > 0.0001f)
         {
-            Velocity = (RawPosition - _lastPosition) / Time.deltaTime;
+            _velocity = (RawPosition - _lastPosition) / Time.deltaTime;
 
             var deltaRot = RawRotation * Quaternion.Inverse(_lastRotation);
             deltaRot.ToAngleAxis(out var angleDeg, out var axis);
             if (angleDeg > 180f) angleDeg -= 360f;
+            
             if (axis.sqrMagnitude > 0.001f)
-                AngularVelocity = axis.normalized * (angleDeg * Mathf.Deg2Rad / Time.deltaTime);
+                _angularVelocity = axis.normalized * (angleDeg * Mathf.Deg2Rad / Time.deltaTime);
             else
-                AngularVelocity = Vector3.zero;
+                _angularVelocity = Vector3.zero;
         }
 
         _lastPosition = RawPosition;
@@ -109,8 +126,8 @@ public class TrackerData
 
     public float GetAdaptiveSmoothFactor(float baseFactor, float speedThreshold = 1.5f)
     {
-        var speed = Velocity.magnitude;
-        var angSpeed = AngularVelocity.magnitude;
+        var speed = _velocity.magnitude;
+        var angSpeed = _angularVelocity.magnitude;
 
         var speedBlend = Mathf.Clamp01(speed / speedThreshold);
         var angBlend = Mathf.Clamp01(angSpeed / (speedThreshold * 3f));
@@ -119,15 +136,14 @@ public class TrackerData
         return Mathf.Lerp(baseFactor, 1f, motionBlend * 0.7f);
     }
 
-    // ReSharper disable once MemberCanBePrivate.Global
-    public void SnapToRaw()
+    private void SnapToRaw()
     {
         SmoothedPosition = RawPosition;
         SmoothedRotation = RawRotation;
         _lastPosition = RawPosition;
         _lastRotation = RawRotation;
-        Velocity = Vector3.zero;
-        AngularVelocity = Vector3.zero;
+        _velocity = Vector3.zero;
+        _angularVelocity = Vector3.zero;
         _initialized = true;
     }
 }
@@ -361,6 +377,131 @@ public static class ElbowIK
     }
 }
 
+public static class SpineIK
+{
+    private const float MaxHeadLean = 35f;
+    private const float HeadLeanInfluence = 0.7f;
+
+    public static SpineResult SolveSpine(
+        Quaternion chestRotation,
+        Quaternion hipRotation,
+        Quaternion headRotation,
+        Quaternion baseBodyRotation,
+        bool hasHipTracker)
+    {
+        var result = new SpineResult();
+        result.ChestRotation = chestRotation;
+        
+        var startRot = hasHipTracker ? hipRotation : baseBodyRotation;
+        
+        result.LowerSpineRotation = Quaternion.Slerp(startRot, chestRotation, 0.35f);
+        result.UpperSpineRotation = Quaternion.Slerp(startRot, chestRotation, 0.70f);
+
+        ComputeHeadLean(headRotation, chestRotation, ref result);
+        return result;
+    }
+
+    private static void ComputeHeadLean(
+        Quaternion headRotation,
+        Quaternion chestRotation,
+        ref SpineResult result)
+    {
+        var headForward = headRotation * Vector3.forward;
+        var chestForward = chestRotation * Vector3.forward;
+
+        var headFlat = new Vector3(headForward.x, 0f, headForward.z).normalized;
+        var chestFlat = new Vector3(chestForward.x, 0f, chestForward.z).normalized;
+
+        if (headFlat.sqrMagnitude < 0.001f || chestFlat.sqrMagnitude < 0.001f)
+        {
+            result.HeadLeanAngle = 0f;
+            result.HeadLeanAxis = Vector3.forward;
+            return;
+        }
+
+        var yawDiff = Vector3.SignedAngle(chestFlat, headFlat, Vector3.up);
+        var headPitch = Mathf.Asin(Mathf.Clamp(headForward.y, -1f, 1f)) * Mathf.Rad2Deg;
+        var chestPitch = Mathf.Asin(Mathf.Clamp(chestForward.y, -1f, 1f)) * Mathf.Rad2Deg;
+        var pitchDiff = headPitch - chestPitch;
+
+        var leanAngle = Mathf.Sqrt(yawDiff * yawDiff + pitchDiff * pitchDiff);
+        leanAngle = Mathf.Clamp(leanAngle * HeadLeanInfluence, 0f, MaxHeadLean);
+
+        var leanDir = new Vector3(pitchDiff, 0f, -yawDiff).normalized;
+        if (leanDir.sqrMagnitude < 0.001f)
+            leanDir = Vector3.forward;
+
+        result.HeadLeanAngle = leanAngle;
+        result.HeadLeanAxis = leanDir;
+    }
+}
+
+public static class Compression
+{
+    public static int PackQuaternion(Quaternion q)
+    {
+        return BitPackUtils.PackQuaternionForNetwork(q);
+    }
+
+    public static int PackFingers(float[] curls)
+    {
+        int packed = 0;
+        for (int i = 0; i < 5; i++)
+        {
+            int val = (int)(Mathf.Clamp01(curls[i]) * 63); 
+            packed |= (val << (i * 6));
+        }
+        return packed;
+    }
+
+    public static float[] UnpackFingers(int packed)
+    {
+        var curls = new float[5];
+        for (int i = 0; i < 5; i++)
+        {
+            int val = (packed >> (i * 6)) & 63;
+            curls[i] = val / 63f;
+        }
+        return curls;
+    }
+}
+
+public static class HapticHelper
+{
+    public static void PulseBoth(float duration = 0.1f, float amplitude = 0.5f)
+    {
+        PulseOne(true, duration, amplitude);
+        PulseOne(false, duration, amplitude);
+    }
+
+    public static void PulseOne(bool isLeft, float duration = 0.1f, float amplitude = 0.5f)
+    {
+        var system = OpenVR.System;
+        if (system == null) return;
+
+        var role = isLeft ? ETrackedControllerRole.LeftHand : ETrackedControllerRole.RightHand;
+        var index = system.GetTrackedDeviceIndexForControllerRole(role);
+
+        if (index != OpenVR.k_unTrackedDeviceIndexInvalid)
+        {
+            var microSeconds = (ushort)(duration * 1_000_000f); 
+            system.TriggerHapticPulse(index, 0, microSeconds);
+        }
+    }
+
+    public static IEnumerator SuccessPulse()
+    {
+        PulseBoth(0.08f, 0.6f);
+        yield return new WaitForSeconds(0.15f);
+        PulseBoth(0.08f, 0.6f);
+    }
+
+    public static void ErrorPulse()
+    {
+        PulseBoth(0.3f, 0.8f);
+    }
+}
+
 public class BodyTrackingClass : MonoBehaviour
 {
     private static readonly Quaternion FlipCorrection = Quaternion.Euler(0f, 180f, 0f);
@@ -369,7 +510,7 @@ public class BodyTrackingClass : MonoBehaviour
 
     private void Update()
     {
-        if (!XRSettings.isDeviceActive)
+        if (OpenVR.System == null)
             return;
 
         if (DisableMod is { Value: true })
@@ -379,6 +520,7 @@ public class BodyTrackingClass : MonoBehaviour
         }
 
         GetTrackedDevices();
+        CheckForTrackerChanges();
         UpdateTrackerSmoothing();
 
         if (!trackersInitialized && _activeDeviceCount >= 2 && _firstSetup is { Value: true })
@@ -391,9 +533,12 @@ public class BodyTrackingClass : MonoBehaviour
             return;
 
         UpdateChestTracking();
+        UpdateSpineAndHeadLean();
 
         if (_elbowTrackingSetting is { Value: true })
             UpdateElbowTracking();
+            
+        UpdateFingerTracking();
     }
 
     private void UpdateChestTracking()
@@ -404,6 +549,33 @@ public class BodyTrackingClass : MonoBehaviour
 
         trackerGo.transform.localRotation = chestTracker.SmoothedRotation * FlipCorrection;
         trackerGo.transform.position = chestTracker.SmoothedPosition;
+        
+        var hipTracker = GetTrackerByRole(TrackerRole.Hip);
+        if (hipTracker is { IsConnected: true, IsValid: true } && hipFollow != null)
+        {
+            hipFollow.transform.localRotation = hipTracker.SmoothedRotation * FlipCorrection;
+        }
+    }
+
+    private void UpdateSpineAndHeadLean()
+    {
+        if (VRRig.LocalRig == null || chestFollow == null) return;
+        if (_spineEnabled == null || !_spineEnabled.Value) return;
+
+        var rig = VRRig.LocalRig;
+
+        var headRotation = rig.head.rigTarget != null
+            ? rig.head.rigTarget.rotation
+            : rig.transform.rotation;
+
+        var chestRotation = chestFollow.transform.rotation;
+        
+        var hipTracker = GetTrackerByRole(TrackerRole.Hip);
+        var hasHip = hipTracker is { IsConnected: true, IsValid: true } && hipFollow != null;
+        
+        var baseRotation = hasHip ? hipFollow!.transform.rotation : rig.transform.rotation;
+
+        _spineResult = SpineIK.SolveSpine(chestRotation, baseRotation, headRotation, rig.transform.rotation, hasHip);
     }
 
     private void UpdateElbowTracking()
@@ -417,7 +589,13 @@ public class BodyTrackingClass : MonoBehaviour
         var rightTracker = GetTrackerByRole(TrackerRole.RightElbow);
 
         var scaleFactor = rig.scaleFactor;
-        var armLength = BaseArmLength * scaleFactor;
+        
+        if (_userHeight != null && _userHeight.Value > 0.5f)
+        {
+            scaleFactor = _userHeight.Value / 1.5f; 
+        }
+
+        var armLength = (_userArmLength?.Value ?? 0.65f) * scaleFactor;
 
         var bodyRot = chestFollow != null
             ? chestFollow.transform.rotation
@@ -491,6 +669,44 @@ public class BodyTrackingClass : MonoBehaviour
         elbowTarget.position = elbowPos;
         elbowTarget.rotation = elbowRot;
     }
+    
+    private readonly float[] _leftFingers = new float[5];
+    private readonly float[] _rightFingers = new float[5];
+
+    private void UpdateFingerTracking()
+    {
+        if (_fingerTrackingEnabled is not { Value: true }) return;
+        if (OpenVR.System == null) return;
+
+        UpdateHandFingers(true, _leftFingers);
+        UpdateHandFingers(false, _rightFingers);
+    }
+
+    private void UpdateHandFingers(bool isLeft, float[] fingers)
+    {
+        var role = isLeft ? ETrackedControllerRole.LeftHand : ETrackedControllerRole.RightHand;
+        var index = OpenVR.System.GetTrackedDeviceIndexForControllerRole(role);
+        
+        if (index == OpenVR.k_unTrackedDeviceIndexInvalid) return;
+
+        var state = new VRControllerState_t();
+        if (OpenVR.System.GetControllerState(index, ref state, (uint)System.Runtime.InteropServices.Marshal.SizeOf(typeof(VRControllerState_t))))
+        {
+            var trigger = state.rAxis1.x; 
+            fingers[1] = trigger; 
+            
+            bool gripped = (state.ulButtonPressed & (1ul << (int)EVRButtonId.k_EButton_Grip)) != 0;
+            float gripVal = gripped ? 1f : 0f;
+            
+            fingers[2] = gripVal;
+            fingers[3] = gripVal;
+            fingers[4] = gripVal;
+            
+            bool thumbDown = (state.ulButtonPressed & (1ul << (int)EVRButtonId.k_EButton_SteamVR_Touchpad)) != 0 
+                             || (state.ulButtonPressed & (1ul << (int)EVRButtonId.k_EButton_Axis0)) != 0;
+            fingers[0] = thumbDown ? 1f : 0f;
+        }
+    }
 
     private static Vector3 GetHandWorldPosition(VRRig rig, bool isLeft)
     {
@@ -539,6 +755,7 @@ public class BodyTrackingClass : MonoBehaviour
     private static readonly Color ChestBtnColor = new(0.25f, 1f, 0.5f);
     private static readonly Color LeftElbowBtnColor = new(0.5f, 0.7f, 1f);
     private static readonly Color RightElbowBtnColor = new(1f, 0.5f, 0.5f);
+    private static readonly Color HipBtnColor = new(1f, 0.5f, 1f);
     private static readonly Color AssignedColor = new(0.3f, 1f, 0.3f);
     private static readonly WaitForSeconds Wait3Seconds = new(3f);
 
@@ -546,6 +763,7 @@ public class BodyTrackingClass : MonoBehaviour
     private readonly TrackerData[] _trackerData = new TrackerData[MaxDevices];
     private readonly uint[] _activeDeviceIds = new uint[MaxDevices];
     private int _activeDeviceCount;
+    private int _lastActiveDeviceCount;
 
     private Transform _leftElbowTarget = null!;
     private Transform _rightElbowTarget = null!;
@@ -554,8 +772,8 @@ public class BodyTrackingClass : MonoBehaviour
 
     private ElbowResult _leftElbowResult;
     private ElbowResult _rightElbowResult;
+    private SpineResult _spineResult;
 
-    private const float BaseArmLength = 0.65f;
     private const float ShoulderWidth = 0.15f;
     private const float ShoulderDrop = 0.05f;
     private const float ShoulderRaise = 0.1f;
@@ -563,8 +781,6 @@ public class BodyTrackingClass : MonoBehaviour
     private static readonly GUIContent GcHeader = new("GORILLA BODY SETTINGS");
     private static readonly GUIContent GcNoTrackers1 = new("<color=Red>NO TRACKERS DETECTED OR IS DISABLED</color>");
     private static readonly GUIContent GcNoTrackers2 = new("<color=Red>CHEST OBJECT NOT MADE-TELL TO GRAZE</color>");
-    private static readonly GUIContent YouWillStillSeeOthers = new("YOU WILL STILL SEE OTHERS");
-    private static readonly GUIContent WhoHaveTheModColonThree = new("WHO HAVE THE MOD :3");
     private static readonly GUIContent RTTrackerL = new("ROTATE TRACKER LEFT");
     private static readonly GUIContent RTTrackerD = new("ROTATE TRACKER DOWN");
     private static readonly GUIContent RTTrackerU = new("ROTATE TRACKER UP");
@@ -575,6 +791,7 @@ public class BodyTrackingClass : MonoBehaviour
     private static readonly GUIContent PressB = new("PRESS <color=#FFC23F>B KEY 3(*)</color> TIMES");
     private static readonly GUIContent ByGraze = new($"BY GRAZE.({PluginInfo.Version})");
     private static readonly GUIContent SetAsChest = new("SET AS CHEST");
+    private static readonly GUIContent SetAsHip = new("SET AS HIP");
     private static readonly GUIContent SetAsLeftElbow = new("SET AS LEFT ELBOW");
     private static readonly GUIContent SetAsRightElbow = new("SET AS RIGHT ELBOW");
     private static readonly GUIContent ClearRoleLabel = new("CLEAR ASSIGNMENT");
@@ -583,6 +800,13 @@ public class BodyTrackingClass : MonoBehaviour
     private static readonly GUIContent SmoothingLabel = new("CHEST SMOOTHING");
     private static readonly GUIContent ElbowSmoothingLabel = new("ELBOW SMOOTHING");
     private static readonly GUIContent AutoAssignLabel = new("AUTO-ASSIGN TRACKERS");
+    private static readonly GUIContent SpineLabel = new("SPINE CHAIN IK");
+    private static readonly GUIContent HeadLeanLabel = new("HEAD LEAN");
+    private static readonly GUIContent AutoDetectLabel = new("AUTO-DETECT TRACKERS");
+    private static readonly GUIContent CalibrateTPoseLabel = new("CALIBRATE T-POSE (ARMS OUT)");
+    private static readonly GUIContent CalibrateHeightLabel = new("CALIBRATE HEIGHT (STAND UP)");
+    private static readonly GUIContent FingerTrackingLabel = new("FINGER TRACKING");
+    private static readonly GUIContent VanillaVisibleLabel = new("VISIBLE TO VANILLA");
 
     #endregion
 
@@ -595,8 +819,7 @@ public class BodyTrackingClass : MonoBehaviour
 
     public bool trackerSetUp, trackersInitialized, inSetup;
     public GameObject? chestFollow;
-
-    public readonly List<TrackedDevicePose_t> TruePoses = new(MaxDevices);
+    public GameObject? hipFollow;
 
     private float _repeatTimer;
     private int _settingsRepeat;
@@ -615,6 +838,7 @@ public class BodyTrackingClass : MonoBehaviour
 
     private static ConfigEntry<bool>? _firstSetup;
     private static ConfigEntry<uint>? _chestDeviceId;
+    private static ConfigEntry<uint>? _hipDeviceId;
     private static ConfigEntry<uint>? _leftElbowDeviceId;
     private static ConfigEntry<uint>? _rightElbowDeviceId;
     private static ConfigEntry<Quaternion>? _trackerOffset;
@@ -622,8 +846,29 @@ public class BodyTrackingClass : MonoBehaviour
     private static ConfigEntry<bool>? _elbowTrackingSetting;
     private static ConfigEntry<float>? _smoothingAmount;
     private static ConfigEntry<float>? _elbowSmoothing;
+    private static ConfigEntry<bool>? _spineEnabled;
+    private static ConfigEntry<bool>? _headLeanEnabled;
+    private static ConfigEntry<bool>? _autoDetectEnabled;
+    private static ConfigEntry<float>? _userArmLength;
+    private static ConfigEntry<float>? _userHeight;
+    private static ConfigEntry<bool>? _fingerTrackingEnabled;
+    private static ConfigEntry<bool>? _vanillaVisible;
 
     private static readonly Dictionary<VRRig, RemoteElbowInfo> RemoteElbowDataMap = new();
+
+    // Accessors
+    public bool IsVanillaVisible => _vanillaVisible is { Value: true };
+    public bool IsSpineEnabled => _spineEnabled is { Value: true };
+    public bool IsHeadLeanEnabled => _headLeanEnabled is { Value: true };
+    public ref ElbowResult GetLeftElbowResult() => ref _leftElbowResult;
+    public ref ElbowResult GetRightElbowResult() => ref _rightElbowResult;
+    public ref SpineResult GetSpineResult() => ref _spineResult;
+    public float[] GetLeftFingers() => _leftFingers;
+    public float[] GetRightFingers() => _rightFingers;
+    public Transform GetLeftElbowTarget() => _leftElbowTarget;
+    public Transform GetRightElbowTarget() => _rightElbowTarget;
+    public bool HasLeftElbow => _hasLeftElbow;
+    public bool HasRightElbow => _hasRightElbow;
 
     #endregion
 
@@ -634,44 +879,43 @@ public class BodyTrackingClass : MonoBehaviour
         Instance = this;
         var config = new ConfigFile(Path.Combine(Paths.ConfigPath, "Graze.GorillaBody.cfg"), true);
 
-        _chestDeviceId = config.Bind("Setup", "Chest Tracker Device ID", uint.MaxValue,
-            "OpenVR device ID of the chest tracker");
-        _leftElbowDeviceId = config.Bind("Setup", "Left Elbow Tracker Device ID", uint.MaxValue,
-            "OpenVR device ID of the left elbow tracker");
-        _rightElbowDeviceId = config.Bind("Setup", "Right Elbow Tracker Device ID", uint.MaxValue,
-            "OpenVR device ID of the right elbow tracker");
-        _firstSetup = config.Bind("Setup", "Setup/Tutorial", false,
-            "Have you gone through the first Setup/Tutorial?");
-        DisableMod = config.Bind("Settings", "Disable Tracking", false,
-            "Enable or Disable using the tracking but still see leaning from others");
-        _elbowTrackingSetting = config.Bind("Settings", "Elbow Tracking", false,
-            "Enable or Disable using Elbow Tracking");
-        _trackerOffset = config.Bind("Setup", "Tracker Rotation Offset", Quaternion.Euler(Vector3.zero),
-            "Saved rotation set by the user");
-        _smoothingAmount = config.Bind("Settings", "Chest Smoothing", 15f,
-            "Chest tracker smoothing (higher = smoother but more latency)");
-        _elbowSmoothing = config.Bind("Settings", "Elbow Smoothing", 12f,
-            "Elbow tracker smoothing (lower = more responsive, motion-adaptive)");
+        // --- RESET ON RESTART LOGIC ---
+        _chestDeviceId = config.Bind("Setup", "Chest Tracker Device ID", uint.MaxValue);
+        _chestDeviceId.Value = uint.MaxValue;
+
+        _hipDeviceId = config.Bind("Setup", "Hip Tracker Device ID", uint.MaxValue);
+        _hipDeviceId.Value = uint.MaxValue;
+
+        _leftElbowDeviceId = config.Bind("Setup", "Left Elbow Tracker Device ID", uint.MaxValue);
+        _leftElbowDeviceId.Value = uint.MaxValue;
+
+        _rightElbowDeviceId = config.Bind("Setup", "Right Elbow Tracker Device ID", uint.MaxValue);
+        _rightElbowDeviceId.Value = uint.MaxValue;
+
+        _trackerOffset = config.Bind("Setup", "Tracker Rotation Offset", Quaternion.identity);
+        _trackerOffset.Value = Quaternion.identity;
+
+        _firstSetup = config.Bind("Setup", "Setup/Tutorial", false);
+        
+        // --- Standard Configs ---
+        DisableMod = config.Bind("Settings", "Disable Tracking", false);
+        _elbowTrackingSetting = config.Bind("Settings", "Elbow Tracking", false);
+        _smoothingAmount = config.Bind("Settings", "Chest Smoothing", 15f);
+        _elbowSmoothing = config.Bind("Settings", "Elbow Smoothing", 12f);
+        _spineEnabled = config.Bind("Settings", "Spine Chain IK", true);
+        _headLeanEnabled = config.Bind("Settings", "Head Lean", true);
+        _autoDetectEnabled = config.Bind("Settings", "Auto Detect Trackers", true);
+        _fingerTrackingEnabled = config.Bind("Settings", "Finger Tracking", true);
+        _vanillaVisible = config.Bind("Settings", "Visible to Vanilla", true);
+        
+        _userArmLength = config.Bind("Calibration", "Arm Length", 0.65f);
+        _userHeight = config.Bind("Calibration", "User Height", 1.5f);
 
         config.SettingChanged += SettingChange;
         config.SaveOnConfigSet = true;
 
         for (var i = 0; i < MaxDevices; i++)
             _trackerData[i] = new TrackerData { DeviceId = (uint)i };
-
-        RestoreRoleAssignments();
-    }
-
-    private void RestoreRoleAssignments()
-    {
-        if (_chestDeviceId is { Value: < MaxDevices })
-            _trackerData[_chestDeviceId.Value].Role = TrackerRole.Chest;
-
-        if (_leftElbowDeviceId is { Value: < MaxDevices })
-            _trackerData[_leftElbowDeviceId.Value].Role = TrackerRole.LeftElbow;
-
-        if (_rightElbowDeviceId is { Value: < MaxDevices })
-            _trackerData[_rightElbowDeviceId.Value].Role = TrackerRole.RightElbow;
     }
 
     private static void SettingChange(object sender, SettingChangedEventArgs e)
@@ -723,6 +967,9 @@ public class BodyTrackingClass : MonoBehaviour
             var gorillaIK = VRRig.LocalRig?.GetComponent<GorillaIK>();
             if (gorillaIK != null && _elbowTrackingSetting != null)
                 gorillaIK.enabled = !_elbowTrackingSetting.Value;
+
+            if (_autoDetectEnabled is { Value: true })
+                AutoAssignTrackers();
         });
     }
 
@@ -800,7 +1047,7 @@ public class BodyTrackingClass : MonoBehaviour
                 rig.syncRotation = BitPackUtils.UnpackQuaternionFromNetwork(bodyData);
                 break;
 
-            case ElbowEventCode when data.CustomData is int[] { Length: >= 4 } elbowData:
+            case ElbowEventCode when data.CustomData is int[] { Length: >= 8 } elbowData:
             {
                 if (!RemoteElbowDataMap.TryGetValue(rig, out var info))
                 {
@@ -808,10 +1055,18 @@ public class BodyTrackingClass : MonoBehaviour
                     RemoteElbowDataMap[rig] = info;
                 }
 
-                info.LeftUpperArmPacked = elbowData[0];
-                info.LeftForearmPacked = elbowData[1];
-                info.RightUpperArmPacked = elbowData[2];
-                info.RightForearmPacked = elbowData[3];
+                info.TargetLeftUpper = BitPackUtils.UnpackQuaternionFromNetwork(elbowData[0]);
+                info.TargetLeftForearm = BitPackUtils.UnpackQuaternionFromNetwork(elbowData[1]);
+                info.TargetRightUpper = BitPackUtils.UnpackQuaternionFromNetwork(elbowData[2]);
+                info.TargetRightForearm = BitPackUtils.UnpackQuaternionFromNetwork(elbowData[3]);
+                info.TargetUpperSpine = BitPackUtils.UnpackQuaternionFromNetwork(elbowData[4]);
+                info.TargetLowerSpine = BitPackUtils.UnpackQuaternionFromNetwork(elbowData[5]);
+                info.TargetHeadLean = BitPackUtils.UnpackQuaternionFromNetwork(elbowData[6]);
+                
+                info.FingerCurlsLeft = Compression.UnpackFingers(elbowData[7]);
+                if (elbowData.Length > 8)
+                    info.FingerCurlsRight = Compression.UnpackFingers(elbowData[8]);
+                
                 info.HasData = true;
                 break;
             }
@@ -821,6 +1076,19 @@ public class BodyTrackingClass : MonoBehaviour
     public static bool TryGetRemoteElbowData(VRRig rig, out RemoteElbowInfo info)
     {
         return RemoteElbowDataMap.TryGetValue(rig, out info);
+    }
+
+    public static void CleanupRemoteData()
+    {
+        var toRemove = new List<VRRig>();
+        foreach (var kvp in RemoteElbowDataMap)
+        {
+            if (kvp.Key == null || !kvp.Key.gameObject.activeInHierarchy)
+                toRemove.Add(kvp.Key!);
+        }
+
+        foreach (var key in toRemove)
+            RemoteElbowDataMap.Remove(key!);
     }
 
     #endregion
@@ -838,8 +1106,8 @@ public class BodyTrackingClass : MonoBehaviour
             _poseCache
         );
 
+        _lastActiveDeviceCount = _activeDeviceCount;
         _activeDeviceCount = 0;
-        TruePoses.Clear();
 
         for (uint i = 0; i < MaxDevices; i++)
         {
@@ -868,11 +1136,26 @@ public class BodyTrackingClass : MonoBehaviour
 
             _activeDeviceIds[_activeDeviceCount] = i;
             _activeDeviceCount++;
-            TruePoses.Add(pose);
 
             if (string.IsNullOrEmpty(tracker.Serial))
                 tracker.Serial = GetDeviceSerial(i);
         }
+    }
+
+    private void CheckForTrackerChanges()
+    {
+        if (_autoDetectEnabled == null || !_autoDetectEnabled.Value)
+            return;
+
+        if (_activeDeviceCount == _lastActiveDeviceCount)
+            return;
+
+        AutoAssignTrackers();
+
+        if (_activeDeviceCount > _lastActiveDeviceCount)
+            StartCoroutine(HapticHelper.SuccessPulse());
+        else
+            HapticHelper.ErrorPulse();
     }
 
     private void UpdateTrackerSmoothing()
@@ -919,6 +1202,9 @@ public class BodyTrackingClass : MonoBehaviour
             case TrackerRole.Chest:
                 if (_chestDeviceId != null) _chestDeviceId.Value = deviceId;
                 break;
+            case TrackerRole.Hip:
+                if (_hipDeviceId != null) _hipDeviceId.Value = deviceId;
+                break;
             case TrackerRole.LeftElbow:
                 if (_leftElbowDeviceId != null) _leftElbowDeviceId.Value = deviceId;
                 break;
@@ -928,6 +1214,22 @@ public class BodyTrackingClass : MonoBehaviour
             case TrackerRole.None:
                 ClearDeviceFromConfig(deviceId);
                 break;
+        }
+
+        if (role != TrackerRole.None)
+        {
+            switch (role)
+            {
+                case TrackerRole.LeftElbow:
+                    HapticHelper.PulseOne(true);
+                    break;
+                case TrackerRole.RightElbow:
+                    HapticHelper.PulseOne(false);
+                    break;
+                default:
+                    HapticHelper.PulseBoth(0.05f, 0.3f);
+                    break;
+            }
         }
     }
 
@@ -941,6 +1243,8 @@ public class BodyTrackingClass : MonoBehaviour
     {
         if (_chestDeviceId is not null && _chestDeviceId.Value == deviceId)
             _chestDeviceId.Value = uint.MaxValue;
+        if (_hipDeviceId is not null && _hipDeviceId.Value == deviceId)
+            _hipDeviceId.Value = uint.MaxValue;
         if (_leftElbowDeviceId is not null && _leftElbowDeviceId.Value == deviceId)
             _leftElbowDeviceId.Value = uint.MaxValue;
         if (_rightElbowDeviceId is not null && _rightElbowDeviceId.Value == deviceId)
@@ -952,77 +1256,106 @@ public class BodyTrackingClass : MonoBehaviour
         for (var i = 0; i < MaxDevices; i++)
             _trackerData[i].Role = TrackerRole.None;
 
-        var trackers = new List<TrackerData>();
+        uint? hmdId = null;
+        uint? leftControllerId = null;
+        uint? rightControllerId = null;
+        var genericTrackers = new List<TrackerData>();
+
         for (var i = 0; i < _activeDeviceCount; i++)
         {
             var tracker = _trackerData[_activeDeviceIds[i]];
-            if (tracker is { DeviceClass: ETrackedDeviceClass.GenericTracker, IsValid: true })
-                trackers.Add(tracker);
-        }
+            if (!tracker.IsValid) continue;
 
-        if (trackers.Count == 0) return;
+            switch (tracker.DeviceClass)
+            {
+                case ETrackedDeviceClass.HMD:
+                    hmdId = tracker.DeviceId;
+                    break;
+
+                case ETrackedDeviceClass.Controller:
+                {
+                    var role = OpenVR.System.GetControllerRoleForTrackedDeviceIndex(tracker.DeviceId);
+                    switch (role)
+                    {
+                        case ETrackedControllerRole.LeftHand:
+                            leftControllerId = tracker.DeviceId;
+                            break;
+                        case ETrackedControllerRole.RightHand:
+                            rightControllerId = tracker.DeviceId;
+                            break;
+                    }
+                    break;
+                }
+
+                case ETrackedDeviceClass.GenericTracker:
+                    genericTrackers.Add(tracker);
+                    break;
+            }
+        }
 
         var hmdPos = Vector3.zero;
         var hmdRot = Quaternion.identity;
-        for (var i = 0; i < _activeDeviceCount; i++)
+        if (hmdId.HasValue)
         {
-            var tracker = _trackerData[_activeDeviceIds[i]];
-            if (tracker is { DeviceClass: ETrackedDeviceClass.HMD, IsValid: true })
-            {
-                hmdPos = tracker.RawPosition;
-                hmdRot = tracker.RawRotation;
-                break;
-            }
+            var hmd = _trackerData[hmdId.Value];
+            hmdPos = hmd.RawPosition;
+            hmdRot = hmd.RawRotation;
         }
 
-        if (trackers.Count >= 1)
+        if (genericTrackers.Count > 0)
         {
-            var chestTarget = hmdPos + Vector3.down * 0.3f;
-            TrackerData? bestChest = null;
-            var bestDist = float.MaxValue;
+            // Sort by Y position (height)
+            genericTrackers.Sort((a, b) => b.RawPosition.y.CompareTo(a.RawPosition.y)); // Descending Y
 
-            foreach (var t in trackers)
+            if (genericTrackers.Count >= 2)
             {
-                var dist = Vector3.Distance(t.RawPosition, chestTarget);
-                if (dist < bestDist)
+                // Highest is Chest
+                AssignRole(genericTrackers[0].DeviceId, TrackerRole.Chest);
+                // Lowest is Hip
+                AssignRole(genericTrackers[genericTrackers.Count - 1].DeviceId, TrackerRole.Hip);
+                
+                genericTrackers.RemoveAt(genericTrackers.Count - 1); // remove hip
+                genericTrackers.RemoveAt(0); // remove chest
+            }
+            else // Only 1
+            {
+                AssignRole(genericTrackers[0].DeviceId, TrackerRole.Chest);
+                genericTrackers.Clear();
+            }
+
+            // Remaining are Elbows
+            if (genericTrackers.Count >= 2)
+            {
+                var hmdRight = hmdRot * Vector3.right;
+                TrackerData? leftMost = null, rightMost = null;
+                var leftDot = float.MaxValue;
+                var rightDot = float.MinValue;
+
+                foreach (var t in genericTrackers)
                 {
-                    bestDist = dist;
-                    bestChest = t;
+                    var dot = Vector3.Dot(t.RawPosition - hmdPos, hmdRight);
+                    if (dot < leftDot) { leftDot = dot; leftMost = t; }
+                    if (dot > rightDot) { rightDot = dot; rightMost = t; }
                 }
-            }
 
-            if (bestChest != null)
-            {
-                AssignRole(bestChest.DeviceId, TrackerRole.Chest);
-                trackers.Remove(bestChest);
+                if (leftMost != null && leftMost != rightMost)
+                    AssignRole(leftMost.DeviceId, TrackerRole.LeftElbow);
+                if (rightMost != null && rightMost != leftMost)
+                    AssignRole(rightMost.DeviceId, TrackerRole.RightElbow);
             }
         }
-
-        if (trackers.Count >= 2)
+        else // No generic trackers
         {
-            var hmdRight = hmdRot * Vector3.right;
-            TrackerData? leftMost = null, rightMost = null;
-            var leftDot = float.MaxValue;
-            var rightDot = float.MinValue;
-
-            foreach (var t in trackers)
-            {
-                var dot = Vector3.Dot(t.RawPosition - hmdPos, hmdRight);
-                if (dot < leftDot) { leftDot = dot; leftMost = t; }
-                if (dot > rightDot) { rightDot = dot; rightMost = t; }
-            }
-
-            if (leftMost != null && leftMost != rightMost)
-                AssignRole(leftMost.DeviceId, TrackerRole.LeftElbow);
-            if (rightMost != null && rightMost != leftMost)
-                AssignRole(rightMost.DeviceId, TrackerRole.RightElbow);
+            if (hmdId.HasValue)
+                AssignRole(hmdId.Value, TrackerRole.Chest);
         }
-        else if (trackers.Count == 1)
-        {
-            var t = trackers[0];
-            var dot = Vector3.Dot(t.RawPosition - hmdPos, hmdRot * Vector3.right);
-            AssignRole(t.DeviceId, dot < 0 ? TrackerRole.LeftElbow : TrackerRole.RightElbow);
-        }
+        
+        // Controllers always fallback for elbows if not assigned
+        if (GetTrackerByRole(TrackerRole.LeftElbow) == null && leftControllerId.HasValue)
+            AssignRole(leftControllerId.Value, TrackerRole.LeftElbow);
+        
+        if (GetTrackerByRole(TrackerRole.RightElbow) == null && rightControllerId.HasValue)
+            AssignRole(rightControllerId.Value, TrackerRole.RightElbow);
     }
 
     private void SetUpChestTracker()
@@ -1032,11 +1365,50 @@ public class BodyTrackingClass : MonoBehaviour
         chestFollow = new GameObject("ChestFollower");
         chestFollow.transform.SetParent(trackerGo.transform, false);
         chestFollow.transform.localPosition = Vector3.zero;
+        
+        hipFollow = new GameObject("HipFollower"); // Create Hip Follower
+        hipFollow.transform.SetParent(trackerGo.transform.parent, false); // Parent to main root, not chest
 
+        // Reset rotation if first setup
         if (_firstSetup is { Value: true } && _trackerOffset != null)
             chestFollow.transform.localRotation = _trackerOffset.Value;
 
         trackerSetUp = true;
+    }
+
+    private void CalibrateBody()
+    {
+        if (chestFollow == null || VRRig.LocalRig == null) return;
+
+        // 1. Reset rotation offset (face forward)
+        var headRot = VRRig.LocalRig.head.rigTarget.rotation;
+        var chestTrackerRot = trackerGo.transform.rotation;
+        var offset = Quaternion.Inverse(chestTrackerRot) * headRot;
+        var euler = offset.eulerAngles;
+        offset = Quaternion.Euler(0, euler.y, 0);
+
+        chestFollow.transform.localRotation = offset;
+        if (_trackerOffset != null) _trackerOffset.Value = offset;
+
+        // 2. Measure Arm Length (T-Pose)
+        var leftHand = VRRig.LocalRig.leftHand.rigTarget.position;
+        var rightHand = VRRig.LocalRig.rightHand.rigTarget.position;
+        var chestPos = chestFollow.transform.position;
+
+        var distL = Vector3.Distance(chestPos, leftHand);
+        var distR = Vector3.Distance(chestPos, rightHand);
+        var avgArm = (distL + distR) / 2f;
+
+        // Gorilla arms are long, usually 1.05x distance from center to hand
+        avgArm *= 1.05f; 
+
+        if (_userArmLength != null) _userArmLength.Value = avgArm;
+
+        // 3. Measure Height (Stand Up)
+        var headHeight = VRRig.LocalRig.head.rigTarget.position.y;
+        if (_userHeight != null) _userHeight.Value = headHeight;
+
+        StartCoroutine(HapticHelper.SuccessPulse());
     }
 
     #endregion
@@ -1047,7 +1419,9 @@ public class BodyTrackingClass : MonoBehaviour
     {
         HandleSetupToggle();
 
-        if (!XRSettings.isDeviceActive)
+        if (_guiSkin == null) return;
+
+        if (OpenVR.System == null)
             NoVrGUI();
         else
             DrawSetupMenu();
@@ -1060,8 +1434,6 @@ public class BodyTrackingClass : MonoBehaviour
         GUILayout.BeginVertical(_guiSkin.box);
         GUILayout.Label(GcHeader, _guiSkin.label);
         GUILayout.Label(NotinVr, _guiSkin.label);
-        GUILayout.Label(YouWillStillSeeOthers, _smallLabel);
-        GUILayout.Label(WhoHaveTheModColonThree, _smallLabel);
         GUILayout.Space(10);
         GUILayout.Label(PressB, _guiSkin.label);
         GUILayout.Label(ByGraze, _guiSkin.label);
@@ -1112,13 +1484,24 @@ public class BodyTrackingClass : MonoBehaviour
         if (_activeDeviceCount <= 1)
         {
             GUILayout.Label(GcNoTrackers1, _smallLabel);
-            GUILayout.Label(YouWillStillSeeOthers, _smallLabel);
-            GUILayout.Label(WhoHaveTheModColonThree, _smallLabel);
         }
         else if (trackerSetUp)
         {
             if (GUILayout.Button(AutoAssignLabel, _guiSkin.button, GUILayout.Height(35)))
+            {
                 AutoAssignTrackers();
+                StartCoroutine(HapticHelper.SuccessPulse());
+            }
+
+            if (GUILayout.Button(CalibrateTPoseLabel, _guiSkin.button, GUILayout.Height(35)))
+            {
+                CalibrateBody();
+            }
+            
+            if (GUILayout.Button(CalibrateHeightLabel, _guiSkin.button, GUILayout.Height(35)))
+            {
+                CalibrateBody();
+            }
 
             GUILayout.Space(5);
             DrawTrackerGrid();
@@ -1168,6 +1551,21 @@ public class BodyTrackingClass : MonoBehaviour
             }
         }
 
+        if (_spineEnabled != null)
+            _spineEnabled.Value = GUILayout.Toggle(_spineEnabled.Value, SpineLabel, _guiSkin.toggle);
+
+        if (_headLeanEnabled != null)
+            _headLeanEnabled.Value = GUILayout.Toggle(_headLeanEnabled.Value, HeadLeanLabel, _guiSkin.toggle);
+
+        if (_autoDetectEnabled != null)
+            _autoDetectEnabled.Value = GUILayout.Toggle(_autoDetectEnabled.Value, AutoDetectLabel, _guiSkin.toggle);
+            
+        if (_fingerTrackingEnabled != null)
+            _fingerTrackingEnabled.Value = GUILayout.Toggle(_fingerTrackingEnabled.Value, FingerTrackingLabel, _guiSkin.toggle);
+            
+        if (_vanillaVisible != null)
+            _vanillaVisible.Value = GUILayout.Toggle(_vanillaVisible.Value, VanillaVisibleLabel, _guiSkin.toggle);
+
         DrawAssignmentSummary();
 
         GUILayout.Space(10);
@@ -1181,31 +1579,23 @@ public class BodyTrackingClass : MonoBehaviour
         GUILayout.Space(5);
 
         var chest = GetTrackerByRole(TrackerRole.Chest);
+        var hip = GetTrackerByRole(TrackerRole.Hip);
         var leftElbow = GetTrackerByRole(TrackerRole.LeftElbow);
         var rightElbow = GetTrackerByRole(TrackerRole.RightElbow);
 
         var origColor = GUI.color;
 
         GUI.color = ChestBtnColor;
-        GUILayout.Label(
-            chest != null
-                ? $"CHEST: [{chest.DeviceId}] {chest.Serial.ToUpper()}"
-                : "CHEST: NOT ASSIGNED",
-            _smallLabel);
+        GUILayout.Label(chest != null ? $"CHEST: [{chest.DeviceId}] {chest.Serial.ToUpper()}" : "CHEST: NOT ASSIGNED", _smallLabel);
+
+        GUI.color = HipBtnColor;
+        GUILayout.Label(hip != null ? $"HIP: [{hip.DeviceId}] {hip.Serial.ToUpper()}" : "HIP: NOT ASSIGNED", _smallLabel);
 
         GUI.color = LeftElbowBtnColor;
-        GUILayout.Label(
-            leftElbow != null
-                ? $"LEFT ELBOW: [{leftElbow.DeviceId}] {leftElbow.Serial.ToUpper()}"
-                : "LEFT ELBOW: NOT ASSIGNED",
-            _smallLabel);
+        GUILayout.Label(leftElbow != null ? $"L.ELBOW: [{leftElbow.DeviceId}] {leftElbow.Serial.ToUpper()}" : "L.ELBOW: NOT ASSIGNED", _smallLabel);
 
         GUI.color = RightElbowBtnColor;
-        GUILayout.Label(
-            rightElbow != null
-                ? $"RIGHT ELBOW: [{rightElbow.DeviceId}] {rightElbow.Serial.ToUpper()}"
-                : "RIGHT ELBOW: NOT ASSIGNED",
-            _smallLabel);
+        GUILayout.Label(rightElbow != null ? $"R.ELBOW: [{rightElbow.DeviceId}] {rightElbow.Serial.ToUpper()}" : "R.ELBOW: NOT ASSIGNED", _smallLabel);
 
         GUI.color = origColor;
     }
@@ -1243,8 +1633,9 @@ public class BodyTrackingClass : MonoBehaviour
                     var roleLabel = tracker.Role switch
                     {
                         TrackerRole.Chest => " [CHEST]",
-                        TrackerRole.LeftElbow => " [L.ELBOW]",
-                        TrackerRole.RightElbow => " [R.ELBOW]",
+                        TrackerRole.Hip => " [HIP]",
+                        TrackerRole.LeftElbow => " [L.ELB]",
+                        TrackerRole.RightElbow => " [R.ELB]",
                         _ => ""
                     };
 
@@ -1268,6 +1659,10 @@ public class BodyTrackingClass : MonoBehaviour
                         GUI.color = ChestBtnColor;
                         if (GUILayout.Button(SetAsChest, _guiSkin.button, GUILayout.Height(22)))
                             AssignRole(deviceId, TrackerRole.Chest);
+
+                        GUI.color = HipBtnColor;
+                        if (GUILayout.Button(SetAsHip, _guiSkin.button, GUILayout.Height(22)))
+                            AssignRole(deviceId, TrackerRole.Hip);
 
                         GUI.color = LeftElbowBtnColor;
                         if (GUILayout.Button(SetAsLeftElbow, _guiSkin.button, GUILayout.Height(22)))
@@ -1385,13 +1780,6 @@ public class BodyTrackingClass : MonoBehaviour
 
         return _serialBuilder.ToString();
     }
-
-    public Transform GetLeftElbowTarget() => _leftElbowTarget;
-    public Transform GetRightElbowTarget() => _rightElbowTarget;
-    public bool HasLeftElbow => _hasLeftElbow;
-    public bool HasRightElbow => _hasRightElbow;
-    public ref ElbowResult GetLeftElbowResult() => ref _leftElbowResult;
-    public ref ElbowResult GetRightElbowResult() => ref _rightElbowResult;
 
     #endregion
 }

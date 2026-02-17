@@ -1,7 +1,7 @@
 using System.Collections.Generic;
 using ExitGames.Client.Photon;
-using GorillaExtensions;
 using GorillaBody;
+using GorillaExtensions;
 using HarmonyLib;
 using Photon.Pun;
 using Photon.Realtime;
@@ -16,7 +16,7 @@ namespace GorillaBody.Patches;
 public static class Patches
 {
     private static readonly List<int> TargetActorCache = new(10);
-    private static readonly int[] ElbowPackedData = new int[4];
+    private static readonly int[] ElbowPackedData = new int[9]; 
     private static readonly Quaternion BoneAlignOffset = Quaternion.Euler(0f, -90f, 0f);
 
     [HarmonyPatch(typeof(VRRig), nameof(VRRig.PostTick))]
@@ -47,11 +47,46 @@ public static class Patches
 
             rig.transform.rotation = plugin.chestFollow.transform.rotation;
 
+            if (plugin.IsSpineEnabled)
+                ApplyLocalSpine(rig, plugin);
+
+            if (plugin.IsHeadLeanEnabled)
+                ApplyLocalHeadLean(rig, plugin);
+
             rig.head.MapMine(rig.scaleFactor, rig.playerOffsetTransform);
             rig.rightHand.MapMine(rig.scaleFactor, rig.playerOffsetTransform);
             rig.leftHand.MapMine(rig.scaleFactor, rig.playerOffsetTransform);
 
             ApplyLocalElbowTracking(rig, plugin);
+            ApplyLocalFingerTracking(rig, plugin);
+        }
+
+        private static void ApplyLocalSpine(VRRig rig, BodyTrackingClass plugin)
+        {
+            ref var spine = ref plugin.GetSpineResult();
+
+            var rigTransform = rig.transform;
+            var lowerSpine = rigTransform.Find("rig/body/spine");
+            var upperSpine = rigTransform.Find("rig/body/spine/chest");
+
+            if (lowerSpine != null)
+                lowerSpine.rotation = spine.LowerSpineRotation;
+
+            if (upperSpine != null)
+                upperSpine.rotation = spine.UpperSpineRotation;
+        }
+
+        private static void ApplyLocalHeadLean(VRRig rig, BodyTrackingClass plugin)
+        {
+            ref var spine = ref plugin.GetSpineResult();
+
+            if (Mathf.Abs(spine.HeadLeanAngle) < 0.5f) return;
+
+            var headBone = rig.transform.Find("rig/body/head");
+            if (headBone == null) return;
+
+            var leanRotation = Quaternion.AngleAxis(spine.HeadLeanAngle, spine.HeadLeanAxis);
+            headBone.rotation = leanRotation * headBone.rotation;
         }
 
         private static void HandleRemoteRig(VRRig rig)
@@ -62,19 +97,14 @@ public static class Patches
             if (!elbowInfo.HasData)
                 return;
 
-            if (elbowInfo.LeftUpperArmPacked != 0)
-            {
-                var upperRot = BitPackUtils.UnpackQuaternionFromNetwork(elbowInfo.LeftUpperArmPacked);
-                var foreRot = BitPackUtils.UnpackQuaternionFromNetwork(elbowInfo.LeftForearmPacked);
-                ApplyRemoteArm(rig, upperRot, foreRot, true);
-            }
+            float t = Time.deltaTime * 12f;
 
-            if (elbowInfo.RightUpperArmPacked != 0)
-            {
-                var upperRot = BitPackUtils.UnpackQuaternionFromNetwork(elbowInfo.RightUpperArmPacked);
-                var foreRot = BitPackUtils.UnpackQuaternionFromNetwork(elbowInfo.RightForearmPacked);
-                ApplyRemoteArm(rig, upperRot, foreRot, false);
-            }
+            // Apply directly (The 'HasData' check above is sufficient)
+            ApplyRemoteArm(rig, elbowInfo.TargetLeftUpper, elbowInfo.TargetLeftForearm, true, t);
+            ApplyRemoteArm(rig, elbowInfo.TargetRightUpper, elbowInfo.TargetRightForearm, false, t);
+            ApplyRemoteSpine(rig, elbowInfo.TargetUpperSpine, elbowInfo.TargetLowerSpine, t);
+            ApplyRemoteHeadLean(rig, elbowInfo.TargetHeadLean, t);
+            ApplyRemoteFingers(rig, elbowInfo.FingerCurlsLeft, elbowInfo.FingerCurlsRight, t);
         }
 
         private static void ApplyLocalElbowTracking(VRRig rig, BodyTrackingClass plugin)
@@ -95,6 +125,11 @@ public static class Patches
                 ApplyArmResult(rig, result, false);
             }
         }
+        
+        private static void ApplyLocalFingerTracking(VRRig rig, BodyTrackingClass plugin)
+        {
+            // Placeholder for local finger application if bones are accessible
+        }
 
         private static void ApplyArmResult(VRRig rig, ElbowResult result, bool isLeft)
         {
@@ -113,7 +148,7 @@ public static class Patches
             forearm.rotation = result.ForearmRotation * BoneAlignOffset;
         }
 
-        private static void ApplyRemoteArm(VRRig rig, Quaternion upperArmRot, Quaternion forearmRot, bool isLeft)
+        private static void ApplyRemoteArm(VRRig rig, Quaternion targetUpper, Quaternion targetFore, bool isLeft, float t)
         {
             var rigTransform = rig.transform;
 
@@ -126,15 +161,61 @@ public static class Patches
             var forearm = upperArm.Find(isLeft ? "forearm.L" : "forearm.R");
             if (forearm == null) return;
 
-            upperArm.rotation = upperArmRot * BoneAlignOffset;
-            forearm.rotation = forearmRot * BoneAlignOffset;
+            upperArm.rotation = Quaternion.Slerp(upperArm.rotation, targetUpper * BoneAlignOffset, t);
+            forearm.rotation = Quaternion.Slerp(forearm.rotation, targetFore * BoneAlignOffset, t);
+        }
+
+        private static void ApplyRemoteSpine(VRRig rig, Quaternion targetUpper, Quaternion targetLower, float t)
+        {
+            var rigTransform = rig.transform;
+
+            var lowerSpine = rigTransform.Find("rig/body/spine");
+            var upperSpine = rigTransform.Find("rig/body/spine/chest");
+
+            if (lowerSpine != null)
+                lowerSpine.rotation = Quaternion.Slerp(lowerSpine.rotation, targetLower, t);
+
+            if (upperSpine != null)
+                upperSpine.rotation = Quaternion.Slerp(upperSpine.rotation, targetUpper, t);
+        }
+
+        private static void ApplyRemoteHeadLean(VRRig rig, Quaternion targetHeadLean, float t)
+        {
+            var headBone = rig.transform.Find("rig/body/head");
+            if (headBone != null)
+            {
+                headBone.rotation = Quaternion.Slerp(headBone.rotation, targetHeadLean * headBone.rotation, t);
+            }
+        }
+        
+        private static void ApplyRemoteFingers(VRRig rig, float[] leftCurls, float[] rightCurls, float t)
+        {
+            // Placeholder
         }
     }
 
     [HarmonyPatch(typeof(VRRig), nameof(VRRig.SerializeWriteShared))]
     internal class VRRigSerializeWriteSharedPatches
     {
-        private static void Postfix(VRRig __instance)
+        private static void Prefix(VRRig __instance, out Quaternion __state)
+        {
+            __state = Quaternion.identity;
+            
+            if (!__instance.isOfflineVRRig) return;
+            
+            var plugin = BodyTrackingClass.Instance;
+            if (plugin == null || BodyTrackingClass.DisableMod is { Value: true }) return;
+
+            if (!plugin.IsVanillaVisible)
+            {
+                __state = __instance.transform.rotation;
+                
+                var headYaw = __instance.head.rigTarget.eulerAngles.y;
+                __instance.transform.rotation = Quaternion.Euler(0, headYaw, 0);
+            }
+        }
+
+        private static void Postfix(VRRig __instance, Quaternion __state)
         {
             if (!__instance.isOfflineVRRig)
                 return;
@@ -145,6 +226,11 @@ public static class Patches
 
             if (BodyTrackingClass.DisableMod is { Value: true })
                 return;
+
+            if (!plugin.IsVanillaVisible && __state != Quaternion.identity)
+            {
+                __instance.transform.rotation = __state;
+            }
 
             if (!PhotonNetwork.InRoom)
                 return;
@@ -174,10 +260,11 @@ public static class Patches
                 SendOptions.SendUnreliable
             );
 
-            if (plugin.HasLeftElbow || plugin.HasRightElbow)
+            if (plugin.HasLeftElbow || plugin.HasRightElbow || plugin.IsSpineEnabled)
             {
                 ref var leftResult = ref plugin.GetLeftElbowResult();
                 ref var rightResult = ref plugin.GetRightElbowResult();
+                ref var spineResult = ref plugin.GetSpineResult();
 
                 ElbowPackedData[0] = plugin.HasLeftElbow
                     ? BitPackUtils.PackQuaternionForNetwork(leftResult.UpperArmRotation)
@@ -191,6 +278,19 @@ public static class Patches
                 ElbowPackedData[3] = plugin.HasRightElbow
                     ? BitPackUtils.PackQuaternionForNetwork(rightResult.ForearmRotation)
                     : 0;
+                ElbowPackedData[4] = plugin.IsSpineEnabled
+                    ? BitPackUtils.PackQuaternionForNetwork(spineResult.UpperSpineRotation)
+                    : 0;
+                ElbowPackedData[5] = plugin.IsSpineEnabled
+                    ? BitPackUtils.PackQuaternionForNetwork(spineResult.LowerSpineRotation)
+                    : 0;
+                ElbowPackedData[6] = plugin.IsHeadLeanEnabled
+                    ? BitPackUtils.PackQuaternionForNetwork(
+                        Quaternion.AngleAxis(spineResult.HeadLeanAngle, spineResult.HeadLeanAxis))
+                    : 0;
+                
+                ElbowPackedData[7] = Compression.PackFingers(plugin.GetLeftFingers());
+                ElbowPackedData[8] = Compression.PackFingers(plugin.GetRightFingers());
 
                 PhotonNetwork.RaiseEvent(
                     BodyTrackingClass.ElbowEventCode,
@@ -251,9 +351,7 @@ public static class Patches
             bool isHeldLeftHanded = (packedFields & 16384) != 0;
             if (num2 != 0)
             {
-                Vector3 localPos;
-                Quaternion q;
-                BitPackUtils.UnpackHandPosRotFromNetwork(data.hoverboardPosRot, out localPos, out q);
+                BitPackUtils.UnpackHandPosRotFromNetwork(data.hoverboardPosRot, out var localPos, out var q);
                 Color boardColor = BitPackUtils.UnpackColorFromNetwork(data.hoverboardColor);
                 if (q.IsValid())
                     __instance.hoverboardVisual.SetIsHeld(isHeldLeftHanded, localPos.ClampMagnitudeSafe(1f), q, boardColor);
@@ -263,9 +361,7 @@ public static class Patches
             if ((packedFields & 65536) != 0)
             {
                 bool isLeftHand = (packedFields & 131072) != 0;
-                Vector3 localPos;
-                Quaternion handRot;
-                BitPackUtils.UnpackHandPosRotFromNetwork(data.propHuntPosRot, out localPos, out handRot);
+                BitPackUtils.UnpackHandPosRotFromNetwork(data.propHuntPosRot, out var localPos, out var handRot);
                 __instance.propHuntHandFollower.SetProp(isLeftHand, localPos, handRot);
             }
             if (__instance.grabbedRopeIsPhotonView)

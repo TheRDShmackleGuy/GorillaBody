@@ -99,7 +99,6 @@ public static class Patches
 
             float t = Time.deltaTime * 12f;
 
-            // Apply directly (The 'HasData' check above is sufficient)
             ApplyRemoteArm(rig, elbowInfo.TargetLeftUpper, elbowInfo.TargetLeftForearm, true, t);
             ApplyRemoteArm(rig, elbowInfo.TargetRightUpper, elbowInfo.TargetRightForearm, false, t);
             ApplyRemoteSpine(rig, elbowInfo.TargetUpperSpine, elbowInfo.TargetLowerSpine, t);
@@ -206,7 +205,8 @@ public static class Patches
             var plugin = BodyTrackingClass.Instance;
             if (plugin == null || BodyTrackingClass.DisableMod is { Value: true }) return;
 
-            if (!plugin.IsVanillaVisible)
+            // **FIX HERE:** Check for ModSided, as it's the only mode that hides rotation from vanilla
+            if (plugin.CurrentVisibilityMode == VisibilityMode.ModSided)
             {
                 __state = __instance.transform.rotation;
                 
@@ -227,7 +227,8 @@ public static class Patches
             if (BodyTrackingClass.DisableMod is { Value: true })
                 return;
 
-            if (!plugin.IsVanillaVisible && __state != Quaternion.identity)
+            // **FIX HERE:** Check for ModSided, as it's the only mode that needs its rotation restored
+            if (plugin.CurrentVisibilityMode == VisibilityMode.ModSided && __state != Quaternion.identity)
             {
                 __instance.transform.rotation = __state;
             }
@@ -252,13 +253,17 @@ public static class Patches
 
             var targetActors = TargetActorCache.ToArray();
 
-            var packedRotation = BitPackUtils.PackQuaternionForNetwork(VRRig.LocalRig.transform.rotation);
-            PhotonNetwork.RaiseEvent(
-                BodyTrackingClass.BodyEventCode,
-                packedRotation,
-                new RaiseEventOptions { TargetActors = targetActors },
-                SendOptions.SendUnreliable
-            );
+            // Send standard body rotation only if not ModSided
+            if (plugin.CurrentVisibilityMode != VisibilityMode.ModSided)
+            {
+                var packedRotation = BitPackUtils.PackQuaternionForNetwork(VRRig.LocalRig.transform.rotation);
+                PhotonNetwork.RaiseEvent(
+                    BodyTrackingClass.BodyEventCode,
+                    packedRotation,
+                    new RaiseEventOptions { TargetActors = targetActors },
+                    SendOptions.SendUnreliable
+                );
+            }
 
             if (plugin.HasLeftElbow || plugin.HasRightElbow || plugin.IsSpineEnabled)
             {
